@@ -5,24 +5,35 @@ import streamlit as st
 from io import BytesIO
 import requests
 import time
+from urllib.parse import urlparse, quote
 
 DB_PATH = "packing.db"
 
 # ============================
-# SharePoint / Graph settings
+# Helpers: read secrets (support old key names too)
 # ============================
-# Put these in Streamlit secrets:
-# TENANT_ID, CLIENT_ID, CLIENT_SECRET
-# SP_HOST = "healthyfresh.sharepoint.com"
-# SP_SITE_PATH = "/sites/Packing"
-# SP_LIST_NAME = "PackingRecords"
-
 def secrets_get(key: str, default=None):
     try:
-        return st.secrets[key]
+        return st.secrets.get(key, default)
     except Exception:
         return default
 
+def get_sp_config():
+    """
+    Support both:
+      SP_HOSTNAME or SP_HOST
+      SP_SITE_PATH
+      SP_LIST_NAME
+    """
+    host = secrets_get("SP_HOSTNAME", "") or secrets_get("SP_HOST", "")
+    site_path = secrets_get("SP_SITE_PATH", "")
+    list_name = secrets_get("SP_LIST_NAME", "")
+    return host, site_path, list_name
+
+
+# ============================
+# Graph token + headers
+# ============================
 def graph_get_token() -> str:
     tenant = secrets_get("TENANT_ID", "")
     client_id = secrets_get("CLIENT_ID", "")
@@ -31,7 +42,6 @@ def graph_get_token() -> str:
     if not tenant or not client_id or not client_secret:
         raise Exception("Missing secrets: TENANT_ID / CLIENT_ID / CLIENT_SECRET")
 
-    # cache token in session to avoid requesting too often
     cache = st.session_state.get("_graph_token_cache", {})
     now = int(time.time())
     if cache and cache.get("access_token") and cache.get("expires_at", 0) > now + 60:
@@ -67,17 +77,84 @@ def graph_headers() -> dict:
         "Content-Type": "application/json"
     }
 
+
+# ============================
+# Graph: site/list/item (FIXED)
+# ============================
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+def _clean_host_and_path(host: str, path: str):
+    host = (host or "").strip()
+    path = (path or "").strip()
+
+    # if host is full url
+    if host.startswith("http://") or host.startswith("https://"):
+        u = urlparse(host)
+        host = u.netloc
+        if not path:
+            path = u.path
+
+    # if path is full url
+    if path.startswith("http://") or path.startswith("https://"):
+        u = urlparse(path)
+        host = u.netloc or host
+        path = u.path
+
+    if path and not path.startswith("/"):
+        path = "/" + path
+
+    # url encode path but keep /
+    path = quote(path, safe="/")
+    return host, path
+
 def graph_get_site_id(host: str, site_path: str) -> str:
-    # Example: host="healthyfresh.sharepoint.com", site_path="/sites/Packing"
-    url = f"https://graph.microsoft.com/v1.0/sites/{host}:{site_path}"
+    """
+    1) try direct: /sites/{host}:{path}
+    2) fallback: /sites?search=...
+    """
+    host, site_path = _clean_host_and_path(host, site_path)
+
+    # ---- direct try
+    url = f"{GRAPH_BASE}/sites/{host}:{site_path}?$select=id,webUrl"
     r = requests.get(url, headers=graph_headers(), timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"Get site failed: {r.status_code} {r.text}")
-    return r.json().get("id", "")
+    if r.status_code == 200:
+        return r.json().get("id", "")
+
+    # ---- fallback search
+    # use last segment of path as keyword, e.g. /sites/Packing -> Packing
+    keyword = "Packing"
+    try:
+        keyword = site_path.split("/")[-1] or "Packing"
+    except:
+        keyword = "Packing"
+
+    s_url = f"{GRAPH_BASE}/sites?search={quote(keyword)}"
+    r2 = requests.get(s_url, headers=graph_headers(), timeout=30)
+    if r2.status_code != 200:
+        raise Exception(
+            f"Get site failed: {r.status_code} {r.text} | "
+            f"search failed: {r2.status_code} {r2.text}"
+        )
+
+    sites = r2.json().get("value", [])
+    if not sites:
+        raise Exception(f"No sites found by search={keyword}. Direct error: {r.status_code} {r.text}")
+
+    host_l = host.lower()
+    want_path = site_path.lower()  # encoded path, but should still contain /sites/packing
+
+    # best match by webUrl includes host + path
+    for s in sites:
+        web = (s.get("webUrl") or "").lower()
+        if host_l in web and "/sites/packing" in web:
+            return s.get("id", "")
+
+    # if still no match, return first one to avoid blocking,
+    # and you can debug by printing the webUrl list later.
+    return sites[0].get("id", "")
 
 def graph_get_list_id(site_id: str, list_name: str) -> str:
-    # list all then match displayName (less fragile than filter)
-    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists?$top=200"
+    url = f"{GRAPH_BASE}/sites/{site_id}/lists?$top=200"
     r = requests.get(url, headers=graph_headers(), timeout=30)
     if r.status_code != 200:
         raise Exception(f"Get lists failed: {r.status_code} {r.text}")
@@ -86,10 +163,12 @@ def graph_get_list_id(site_id: str, list_name: str) -> str:
     for it in items:
         if it.get("displayName") == list_name:
             return it.get("id", "")
-    raise Exception(f"List not found: {list_name}")
+    # show what lists exist (helps you debug)
+    names = [x.get("displayName") for x in items]
+    raise Exception(f"List not found: {list_name}. Existing lists: {names}")
 
 def graph_create_list_item(site_id: str, list_id: str, fields: dict) -> dict:
-    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
+    url = f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items"
     payload = {"fields": fields}
     r = requests.post(url, headers=graph_headers(), json=payload, timeout=30)
     if r.status_code not in (200, 201):
@@ -97,25 +176,25 @@ def graph_create_list_item(site_id: str, list_id: str, fields: dict) -> dict:
     return r.json()
 
 def sp_push_record_to_list(rec: dict) -> None:
-    host = secrets_get("SP_HOST", "")
-    site_path = secrets_get("SP_SITE_PATH", "")
-    list_name = secrets_get("SP_LIST_NAME", "")
-
+    host, site_path, list_name = get_sp_config()
     if not host or not site_path or not list_name:
-        raise Exception("Missing secrets: SP_HOST / SP_SITE_PATH / SP_LIST_NAME")
+        raise Exception("Missing secrets: SP_HOSTNAME(or SP_HOST) / SP_SITE_PATH / SP_LIST_NAME")
 
     site_id = st.session_state.get("_sp_site_id")
     list_id = st.session_state.get("_sp_list_id")
 
     if not site_id:
         site_id = graph_get_site_id(host, site_path)
+        if not site_id:
+            raise Exception("Site ID is empty (graph_get_site_id returned empty).")
         st.session_state["_sp_site_id"] = site_id
 
     if not list_id:
         list_id = graph_get_list_id(site_id, list_name)
+        if not list_id:
+            raise Exception("List ID is empty (graph_get_list_id returned empty).")
         st.session_state["_sp_list_id"] = list_id
 
-    # Make sure numbers are numbers (avoid your earlier error)
     def num(v, default=0):
         try:
             if v is None or v == "":
@@ -129,11 +208,7 @@ def sp_push_record_to_list(rec: dict) -> None:
     title = f"{work_date} {pack_type}".strip() or work_date
 
     fields = {
-        # SharePoint default required column
         "Title": title,
-
-        # Your columns (match your SharePoint column internal names)
-        # If your column internal name differs, rename here.
         "WorkDate": work_date,
         "Shift": rec.get("shift") or "",
         "Line": rec.get("line") or "",
@@ -147,6 +222,7 @@ def sp_push_record_to_list(rec: dict) -> None:
     }
 
     graph_create_list_item(site_id, list_id, fields)
+
 
 # ----------------------------
 # DB helpers
@@ -190,7 +266,6 @@ def init_db():
     )
     """)
 
-    # default settings
     cur.execute("SELECT value FROM settings WHERE key='hourly_rate'")
     if cur.fetchone() is None:
         cur.execute("INSERT INTO settings(key, value) VALUES(?, ?)", ("hourly_rate", "0"))
@@ -199,7 +274,6 @@ def init_db():
     if cur.fetchone() is None:
         cur.execute("INSERT INTO settings(key, value) VALUES(?, ?)", ("sync_to_sharepoint", "0"))
 
-    # default pack types (optional)
     cur.execute("SELECT COUNT(*) FROM pack_types")
     if cur.fetchone()[0] == 0:
         defaults = ["500g x 20", "200g x 30", "100g x 52"]
@@ -226,7 +300,6 @@ def set_setting(key: str, value: str):
 def get_pack_types():
     conn = get_conn()
     df = pd.read_sql_query("SELECT name FROM pack_types ORDER BY name", conn)
-
     conn.close()
     return df["name"].tolist()
 
@@ -283,6 +356,7 @@ def delete_record(record_id: int):
     cur.execute("DELETE FROM records WHERE id=?", (record_id,))
     conn.commit()
     conn.close()
+
 
 # ----------------------------
 # Calculations
@@ -353,6 +427,7 @@ def to_excel_bytes(raw_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
     return output.getvalue()
 
+
 # ----------------------------
 # App
 # ----------------------------
@@ -364,7 +439,6 @@ st.title("Packing input → Auto costing (per punnet) → Export Excel")
 # Sidebar settings
 st.sidebar.header("Settings")
 
-# hourly rate
 try:
     hourly_rate = float(get_setting("hourly_rate", "0"))
 except:
@@ -377,7 +451,6 @@ if st.sidebar.button("Save hourly rate"):
 
 st.sidebar.divider()
 
-# Sync to SharePoint toggle
 sync_default = get_setting("sync_to_sharepoint", "0")
 sync_now = st.sidebar.toggle("Also write to SharePoint (Graph)", value=(sync_default == "1"))
 set_setting("sync_to_sharepoint", "1" if sync_now else "0")
@@ -389,9 +462,10 @@ with st.sidebar.expander("Test SharePoint connection"):
             token = graph_get_token()
             st.success(f"Token OK (len={len(token)})")
 
-            host = secrets_get("SP_HOST", "")
-            site_path = secrets_get("SP_SITE_PATH", "")
-            list_name = secrets_get("SP_LIST_NAME", "")
+            host, site_path, list_name = get_sp_config()
+            st.write("Host:", host)
+            st.write("Site path:", site_path)
+            st.write("List:", list_name)
 
             site_id = graph_get_site_id(host, site_path)
             list_id = graph_get_list_id(site_id, list_name)
@@ -476,10 +550,8 @@ with tab1:
                 "note": note.strip() if note else None
             }
 
-            # Save local first
             insert_record(rec)
 
-            # Optional: push to SharePoint
             if get_setting("sync_to_sharepoint", "0") == "1":
                 try:
                     sp_push_record_to_list(rec)
@@ -490,7 +562,6 @@ with tab1:
             else:
                 st.success("Saved ✅ (Local only)")
 
-            # quick result
             hr = float(get_setting("hourly_rate", "0") or 0)
             labour_hours = (minutes * people) / 60.0
             pph = finished_punnets / labour_hours if labour_hours > 0 else 0
