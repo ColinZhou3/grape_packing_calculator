@@ -1,332 +1,226 @@
-import sqlite3
-from datetime import datetime, date
+import os
+import time
+import requests
 import pandas as pd
 import streamlit as st
+from datetime import date, datetime
 from io import BytesIO
-import requests
-import time
 
-DB_PATH = "packing.db"
+# =========================
+# Your SharePoint config
+# =========================
+SP_HOSTNAME = "healthyfresh.sharepoint.com"
+SP_SITE_PATH = "/sites/Packing"
+SP_LIST_NAME = "PackingRecords"
 
-# ============================
-# SharePoint / Graph settings
-# ============================
-# Put these in Streamlit secrets:
-# TENANT_ID, CLIENT_ID, CLIENT_SECRET
-# SP_HOST = "healthyfresh.sharepoint.com"
-# SP_SITE_PATH = "/sites/Packing"
-# SP_LIST_NAME = "PackingRecords"
+SP_COL_TITLE = "Title"
+SP_COL_WORKDATE = "WorkDate"
+SP_COL_SHIFT = "Shift"
+SP_COL_LINE = "Line"
+SP_COL_PACKTYPE = "PackType"
+SP_COL_MINUTES = "Minutes"
+SP_COL_PEOPLE = "People"
+SP_COL_FINISHED = "FinishedPunnets"
+SP_COL_WASTE = "WastePunnets"
+SP_COL_DOWNTIME = "DowntimeMinutes"
+SP_COL_NOTE = "Note"
 
-def secrets_get(key: str, default=None):
-    try:
-        return st.secrets[key]
-    except Exception:
-        return default
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-def graph_get_token() -> str:
-    tenant = secrets_get("TENANT_ID", "")
-    client_id = secrets_get("CLIENT_ID", "")
-    client_secret = secrets_get("CLIENT_SECRET", "")
 
-    if not tenant or not client_id or not client_secret:
-        raise Exception("Missing secrets: TENANT_ID / CLIENT_ID / CLIENT_SECRET")
+# =========================
+# Helpers
+# =========================
+def must_env(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return v
 
-    # cache token in session to avoid requesting too often
-    cache = st.session_state.get("_graph_token_cache", {})
-    now = int(time.time())
-    if cache and cache.get("access_token") and cache.get("expires_at", 0) > now + 60:
-        return cache["access_token"]
 
-    url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+@st.cache_data(show_spinner=False)
+def get_access_token_cached(tenant_id: str, client_id: str, client_secret: str) -> dict:
+    """
+    Return dict:
+      { "access_token": "...", "expires_at": 1234567890 }
+    """
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     data = {
         "client_id": client_id,
         "client_secret": client_secret,
-        "grant_type": "client_credentials",
         "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
     }
-    r = requests.post(url, data=data, timeout=30)
+    r = requests.post(token_url, data=data, timeout=30)
     if r.status_code != 200:
-        raise Exception(f"Token request failed: {r.status_code} {r.text}")
+        raise RuntimeError(f"Token request failed: {r.status_code} {r.text}")
 
     js = r.json()
-    token = js.get("access_token", "")
-    if not token:
-        raise Exception(f"Token is empty. Raw response: {r.text}")
+    access_token = js.get("access_token", "")
+    expires_in = int(js.get("expires_in", 3599))
+    return {"access_token": access_token, "expires_at": int(time.time()) + expires_in - 60}
 
-    expires_in = int(js.get("expires_in", 3600))
-    st.session_state["_graph_token_cache"] = {
-        "access_token": token,
-        "expires_at": now + expires_in
-    }
-    return token
+
+def get_token() -> str:
+    tenant_id = must_env("AZURE_TENANT_ID")
+    client_id = must_env("AZURE_CLIENT_ID")
+    client_secret = must_env("AZURE_CLIENT_SECRET")
+
+    tok = get_access_token_cached(tenant_id, client_id, client_secret)
+    if not tok.get("access_token"):
+        raise RuntimeError("Access token is empty. Check your client secret VALUE.")
+    return tok["access_token"]
+
 
 def graph_headers() -> dict:
-    token = graph_get_token()
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
 
-def graph_get_site_id(host: str, site_path: str) -> str:
-    # Example: host="healthyfresh.sharepoint.com", site_path="/sites/Packing"
-    url = f"https://graph.microsoft.com/v1.0/sites/{host}:{site_path}"
+
+@st.cache_data(show_spinner=False)
+def get_site_id(hostname: str, site_path: str) -> str:
+    # Correct Graph format:
+    # GET /sites/{hostname}:{site-path}
+    url = f"{GRAPH_BASE}/sites/{hostname}:{site_path}"
     r = requests.get(url, headers=graph_headers(), timeout=30)
     if r.status_code != 200:
-        raise Exception(f"Get site failed: {r.status_code} {r.text}")
-    return r.json().get("id", "")
+        raise RuntimeError(f"Get site failed: {r.status_code} {r.text}")
+    return r.json()["id"]
 
-def graph_get_list_id(site_id: str, list_name: str) -> str:
-    # list all then match displayName (less fragile than filter)
-    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists?$top=200"
+
+@st.cache_data(show_spinner=False)
+def get_list_id(site_id: str, list_name: str) -> str:
+    # Find list by displayName
+    url = f"{GRAPH_BASE}/sites/{site_id}/lists?$select=id,displayName"
     r = requests.get(url, headers=graph_headers(), timeout=30)
     if r.status_code != 200:
-        raise Exception(f"Get lists failed: {r.status_code} {r.text}")
+        raise RuntimeError(f"Get lists failed: {r.status_code} {r.text}")
 
-    items = r.json().get("value", [])
-    for it in items:
+    lists = r.json().get("value", [])
+    for it in lists:
         if it.get("displayName") == list_name:
-            return it.get("id", "")
-    raise Exception(f"List not found: {list_name}")
+            return it["id"]
 
-def graph_create_list_item(site_id: str, list_id: str, fields: dict) -> dict:
-    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
+    # If not found, show what exists
+    names = [x.get("displayName") for x in lists]
+    raise RuntimeError(f"List '{list_name}' not found. Existing lists: {names}")
+
+
+def to_number(x, default=0.0):
+    if x is None:
+        return default
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if s == "":
+        return default
+    try:
+        return float(s)
+    except:
+        return default
+
+
+def safe_text(x):
+    s = "" if x is None else str(x).strip()
+    return s
+
+
+def build_title(work_date: date, pack_type: str, shift: str, line: str) -> str:
+    # Title is usually required in SharePoint list, so we always set it.
+    pt = pack_type if pack_type else "Packing"
+    sh = shift if shift else ""
+    ln = line if line else ""
+    return f"{work_date.isoformat()} {pt} {sh} {ln}".strip()
+
+
+def create_list_item(site_id: str, list_id: str, fields: dict) -> dict:
+    url = f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items"
     payload = {"fields": fields}
     r = requests.post(url, headers=graph_headers(), json=payload, timeout=30)
     if r.status_code not in (200, 201):
-        raise Exception(f"Create item failed: {r.status_code} {r.text}")
+        raise RuntimeError(f"Create item failed: {r.status_code} {r.text}")
     return r.json()
 
-def sp_push_record_to_list(rec: dict) -> None:
-    host = secrets_get("SP_HOST", "")
-    site_path = secrets_get("SP_SITE_PATH", "")
-    list_name = secrets_get("SP_LIST_NAME", "")
 
-    if not host or not site_path or not list_name:
-        raise Exception("Missing secrets: SP_HOST / SP_SITE_PATH / SP_LIST_NAME")
+def get_all_items(site_id: str, list_id: str, top=200) -> list:
+    # Get items with fields expanded
+    url = f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items?expand=fields&$top={top}"
+    out = []
+    while url:
+        r = requests.get(url, headers=graph_headers(), timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"List items failed: {r.status_code} {r.text}")
+        js = r.json()
+        out.extend(js.get("value", []))
+        url = js.get("@odata.nextLink")
+    return out
 
-    site_id = st.session_state.get("_sp_site_id")
-    list_id = st.session_state.get("_sp_list_id")
 
-    if not site_id:
-        site_id = graph_get_site_id(host, site_path)
-        st.session_state["_sp_site_id"] = site_id
-
-    if not list_id:
-        list_id = graph_get_list_id(site_id, list_name)
-        st.session_state["_sp_list_id"] = list_id
-
-    # Make sure numbers are numbers (avoid your earlier error)
-    def num(v, default=0):
-        try:
-            if v is None or v == "":
-                return default
-            return float(v)
-        except Exception:
-            return default
-
-    work_date = rec.get("work_date")  # "YYYY-MM-DD"
-    pack_type = rec.get("pack_type") or ""
-    title = f"{work_date} {pack_type}".strip() or work_date
-
-    fields = {
-        # SharePoint default required column
-        "Title": title,
-
-        # Your columns (match your SharePoint column internal names)
-        # If your column internal name differs, rename here.
-        "WorkDate": work_date,
-        "Shift": rec.get("shift") or "",
-        "Line": rec.get("line") or "",
-        "PackType": rec.get("pack_type") or "",
-        "Minutes": num(rec.get("minutes")),
-        "People": num(rec.get("people")),
-        "FinishedPunnets": num(rec.get("finished_punnets")),
-        "WastePunnets": num(rec.get("waste_punnets")),
-        "DowntimeMinutes": num(rec.get("downtime_minutes")),
-        "Note": rec.get("note") or ""
-    }
-
-    graph_create_list_item(site_id, list_id, fields)
-
-# ----------------------------
-# DB helpers
-# ----------------------------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pack_types(
-        name TEXT PRIMARY KEY
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS records(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        work_date TEXT NOT NULL,
-        shift TEXT,
-        line TEXT,
-        pack_type TEXT,
-        minutes REAL NOT NULL,
-        people REAL NOT NULL,
-        finished_punnets REAL NOT NULL,
-        waste_punnets REAL DEFAULT 0,
-        downtime_minutes REAL DEFAULT 0,
-        note TEXT
-    )
-    """)
-
-    # default settings
-    cur.execute("SELECT value FROM settings WHERE key='hourly_rate'")
-    if cur.fetchone() is None:
-        cur.execute("INSERT INTO settings(key, value) VALUES(?, ?)", ("hourly_rate", "0"))
-
-    cur.execute("SELECT value FROM settings WHERE key='sync_to_sharepoint'")
-    if cur.fetchone() is None:
-        cur.execute("INSERT INTO settings(key, value) VALUES(?, ?)", ("sync_to_sharepoint", "0"))
-
-    # default pack types (optional)
-    cur.execute("SELECT COUNT(*) FROM pack_types")
-    if cur.fetchone()[0] == 0:
-        defaults = ["500g x 20", "200g x 30", "100g x 52"]
-        cur.executemany("INSERT OR IGNORE INTO pack_types(name) VALUES(?)", [(x,) for x in defaults])
-
-    conn.commit()
-    conn.close()
-
-def get_setting(key: str, default=""):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-def set_setting(key: str, value: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, str(value)))
-    conn.commit()
-    conn.close()
-
-def get_pack_types():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT name FROM pack_types ORDER BY name", conn)
-
-    conn.close()
-    return df["name"].tolist()
-
-def add_pack_type(name: str):
-    name = (name or "").strip()
-    if not name:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO pack_types(name) VALUES(?)", (name,))
-    conn.commit()
-    conn.close()
-
-def delete_pack_type(name: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM pack_types WHERE name=?", (name,))
-    conn.commit()
-    conn.close()
-
-def insert_record(r: dict):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO records(
-        created_at, work_date, shift, line, pack_type,
-        minutes, people, finished_punnets, waste_punnets, downtime_minutes, note
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        r["created_at"], r["work_date"], r.get("shift"), r.get("line"), r.get("pack_type"),
-        r["minutes"], r["people"], r["finished_punnets"], r.get("waste_punnets", 0),
-        r.get("downtime_minutes", 0), r.get("note")
-    ))
-    conn.commit()
-    conn.close()
-
-def load_records(start: date, end: date):
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT * FROM records
-        WHERE date(work_date) BETWEEN date(?) AND date(?)
-        ORDER BY date(work_date) DESC, id DESC
-        """,
-        conn,
-        params=(start.isoformat(), end.isoformat())
-    )
-    conn.close()
+def items_to_df(items: list) -> pd.DataFrame:
+    rows = []
+    for it in items:
+        f = it.get("fields", {}) or {}
+        rows.append({
+            "ItemId": it.get("id"),
+            SP_COL_TITLE: f.get(SP_COL_TITLE),
+            SP_COL_WORKDATE: f.get(SP_COL_WORKDATE),
+            SP_COL_SHIFT: f.get(SP_COL_SHIFT),
+            SP_COL_LINE: f.get(SP_COL_LINE),
+            SP_COL_PACKTYPE: f.get(SP_COL_PACKTYPE),
+            SP_COL_MINUTES: f.get(SP_COL_MINUTES),
+            SP_COL_PEOPLE: f.get(SP_COL_PEOPLE),
+            SP_COL_FINISHED: f.get(SP_COL_FINISHED),
+            SP_COL_WASTE: f.get(SP_COL_WASTE),
+            SP_COL_DOWNTIME: f.get(SP_COL_DOWNTIME),
+            SP_COL_NOTE: f.get(SP_COL_NOTE),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty and SP_COL_WORKDATE in df.columns:
+        df[SP_COL_WORKDATE] = pd.to_datetime(df[SP_COL_WORKDATE], errors="coerce").dt.date
     return df
 
-def delete_record(record_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM records WHERE id=?", (record_id,))
-    conn.commit()
-    conn.close()
 
-# ----------------------------
-# Calculations
-# ----------------------------
 def add_calculated_cols(df: pd.DataFrame, hourly_rate: float) -> pd.DataFrame:
     if df.empty:
         return df
 
     df = df.copy()
-    df["labour_hours"] = (df["minutes"] * df["people"]) / 60.0
+    # Convert numbers
+    for c in [SP_COL_MINUTES, SP_COL_PEOPLE, SP_COL_FINISHED, SP_COL_WASTE, SP_COL_DOWNTIME]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+    df["labour_hours"] = (df[SP_COL_MINUTES] * df[SP_COL_PEOPLE]) / 60.0
     df["punnets_per_labour_hour"] = df.apply(
-        lambda x: (x["finished_punnets"] / x["labour_hours"]) if x["labour_hours"] > 0 else 0,
+        lambda x: (x[SP_COL_FINISHED] / x["labour_hours"]) if x["labour_hours"] > 0 else 0,
         axis=1
     )
     df["labour_cost_per_punnet"] = df.apply(
-        lambda x: ((x["labour_hours"] * hourly_rate) / x["finished_punnets"]) if x["finished_punnets"] > 0 else 0,
+        lambda x: ((x["labour_hours"] * hourly_rate) / x[SP_COL_FINISHED]) if x[SP_COL_FINISHED] > 0 else 0,
         axis=1
     )
-
     df["waste_rate"] = df.apply(
-        lambda x: (x["waste_punnets"] / (x["finished_punnets"] + x["waste_punnets"]))
-        if (x["finished_punnets"] + x["waste_punnets"]) > 0 else 0,
+        lambda x: (x[SP_COL_WASTE] / (x[SP_COL_FINISHED] + x[SP_COL_WASTE]))
+        if (x[SP_COL_FINISHED] + x[SP_COL_WASTE]) > 0 else 0,
         axis=1
     )
     return df
+
 
 def make_summary(df: pd.DataFrame, hourly_rate: float) -> pd.DataFrame:
     if df.empty:
         return df
 
     df2 = df.copy()
-    df2["work_date"] = pd.to_datetime(df2["work_date"]).dt.date
-
-    gcols = ["work_date", "pack_type"]
+    gcols = [SP_COL_WORKDATE, SP_COL_PACKTYPE]
     out = df2.groupby(gcols, dropna=False).agg(
-        minutes=("minutes", "sum"),
-        people=("people", "sum"),
-        finished_punnets=("finished_punnets", "sum"),
-        waste_punnets=("waste_punnets", "sum"),
-        downtime_minutes=("downtime_minutes", "sum"),
+        minutes=(SP_COL_MINUTES, "sum"),
+        people=(SP_COL_PEOPLE, "sum"),
+        finished_punnets=(SP_COL_FINISHED, "sum"),
+        waste_punnets=(SP_COL_WASTE, "sum"),
+        downtime_minutes=(SP_COL_DOWNTIME, "sum"),
     ).reset_index()
 
-    df2["labour_hours"] = (df2["minutes"] * df2["people"]) / 60.0
+    df2["labour_hours"] = (df2[SP_COL_MINUTES] * df2[SP_COL_PEOPLE]) / 60.0
     lh = df2.groupby(gcols, dropna=False)["labour_hours"].sum().reset_index(name="labour_hours")
     out = out.merge(lh, on=gcols, how="left")
 
@@ -343,8 +237,9 @@ def make_summary(df: pd.DataFrame, hourly_rate: float) -> pd.DataFrame:
         axis=1
     )
 
-    out = out.sort_values(["work_date", "pack_type"], ascending=[False, True])
+    out = out.sort_values([SP_COL_WORKDATE, SP_COL_PACKTYPE], ascending=[False, True])
     return out
+
 
 def to_excel_bytes(raw_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     output = BytesIO()
@@ -353,193 +248,149 @@ def to_excel_bytes(raw_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
     return output.getvalue()
 
-# ----------------------------
-# App
-# ----------------------------
-st.set_page_config(page_title="Packing Costing (per punnet)", layout="wide")
-init_db()
 
-st.title("Packing input → Auto costing (per punnet) → Export Excel")
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Packing → SharePoint", layout="wide")
+st.title("Packing input → Save to SharePoint → Export Excel")
 
-# Sidebar settings
-st.sidebar.header("Settings")
+st.sidebar.header("Connection test")
 
-# hourly rate
 try:
-    hourly_rate = float(get_setting("hourly_rate", "0"))
-except:
-    hourly_rate = 0.0
-
-new_rate = st.sidebar.number_input("Hourly rate ($/hour)", min_value=0.0, value=float(hourly_rate), step=0.5)
-if st.sidebar.button("Save hourly rate"):
-    set_setting("hourly_rate", str(new_rate))
-    st.sidebar.success("Saved")
-
-st.sidebar.divider()
-
-# Sync to SharePoint toggle
-sync_default = get_setting("sync_to_sharepoint", "0")
-sync_now = st.sidebar.toggle("Also write to SharePoint (Graph)", value=(sync_default == "1"))
-set_setting("sync_to_sharepoint", "1" if sync_now else "0")
-
-# Quick test connection
-with st.sidebar.expander("Test SharePoint connection"):
-    if st.button("Test Graph token + site + list"):
-        try:
-            token = graph_get_token()
-            st.success(f"Token OK (len={len(token)})")
-
-            host = secrets_get("SP_HOST", "")
-            site_path = secrets_get("SP_SITE_PATH", "")
-            list_name = secrets_get("SP_LIST_NAME", "")
-
-            site_id = graph_get_site_id(host, site_path)
-            list_id = graph_get_list_id(site_id, list_name)
-            st.success(f"Site OK: {site_id[:20]}...")
-            st.success(f"List OK: {list_id[:20]}...")
-
-        except Exception as e:
-            st.error(str(e))
+    site_id = get_site_id(SP_HOSTNAME, SP_SITE_PATH)
+    list_id = get_list_id(site_id, SP_LIST_NAME)
+    st.sidebar.success("Graph token OK + Site OK + List OK")
+    st.sidebar.write("Site ID:", site_id)
+    st.sidebar.write("List ID:", list_id)
+except Exception as e:
+    st.sidebar.error(str(e))
+    st.stop()
 
 st.sidebar.divider()
-st.sidebar.subheader("Pack Types (optional)")
-pack_types = get_pack_types()
-new_pack = st.sidebar.text_input("Add pack type", placeholder="e.g. 500g x 20")
-if st.sidebar.button("Add pack type"):
-    add_pack_type(new_pack)
-    st.sidebar.success("Added (if not exists)")
-    st.rerun()
+hourly_rate = st.sidebar.number_input("Hourly rate ($/hour)", min_value=0.0, value=0.0, step=0.5)
 
-if pack_types:
-    del_pack = st.sidebar.selectbox("Delete pack type", ["(none)"] + pack_types)
-    if st.sidebar.button("Delete selected"):
-        if del_pack != "(none)":
-            delete_pack_type(del_pack)
-            st.sidebar.success("Deleted")
-            st.rerun()
+tab1, tab2, tab3 = st.tabs(["New entry", "View", "Export"])
 
-st.sidebar.divider()
-st.sidebar.caption("Tip: Finished punnets is manual input (no need to keep punnet-per-crate updated).")
 
-tab1, tab2, tab3 = st.tabs(["New entry", "View & delete", "Export report"])
-
-# ----------------------------
+# -------------------------
 # Tab 1: New entry
-# ----------------------------
+# -------------------------
 with tab1:
-    st.subheader("New packing record")
+    st.subheader("New packing record (save to SharePoint)")
 
-    pack_types = get_pack_types()
-    pack_choice_list = ["(blank)"] + pack_types
-
-    with st.form("new_record_form", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
+    with st.form("new_record", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
             work_date = st.date_input("Work date", value=date.today())
-            shift = st.text_input("Shift (optional)", placeholder="e.g. AM / PM")
-        with col2:
-            line = st.text_input("Line (optional)", placeholder="e.g. Line 1")
-            pack_type = st.selectbox("Pack type (optional)", pack_choice_list)
-        with col3:
+            shift = st.text_input("Shift (optional)", placeholder="AM / PM")
+        with c2:
+            line = st.text_input("Line (optional)", placeholder="Line 1")
+            pack_type = st.text_input("Pack type (optional)", placeholder="500g x 20")
+        with c3:
             minutes = st.number_input("Minutes", min_value=0.0, value=0.0, step=1.0)
             people = st.number_input("People", min_value=0.0, value=0.0, step=0.5)
 
-        col4, col5, col6 = st.columns(3)
-        with col4:
-            finished_punnets = st.number_input("Finished punnets", min_value=0.0, value=0.0, step=1.0)
-        with col5:
-            waste_punnets = st.number_input("Waste punnets (optional)", min_value=0.0, value=0.0, step=1.0)
-        with col6:
-            downtime_minutes = st.number_input("Downtime minutes (optional)", min_value=0.0, value=0.0, step=1.0)
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            finished = st.number_input("Finished punnets", min_value=0.0, value=0.0, step=1.0)
+        with c5:
+            waste = st.number_input("Waste punnets (optional)", min_value=0.0, value=0.0, step=1.0)
+        with c6:
+            downtime = st.number_input("Downtime minutes (optional)", min_value=0.0, value=0.0, step=1.0)
 
-        note = st.text_area("Note (optional)", placeholder="e.g. changeover, fruit soft, waiting pallet...")
+        note = st.text_area("Note (optional)", placeholder="changeover, fruit soft, waiting pallet...")
 
-        submitted = st.form_submit_button("Save record")
+        ok = st.form_submit_button("Save to SharePoint")
 
-    if submitted:
+    if ok:
         if minutes <= 0 or people <= 0:
             st.error("Minutes and People must be > 0.")
-        elif finished_punnets <= 0:
-            st.error("Finished punnets must be > 0 (for costing).")
+        elif finished <= 0:
+            st.error("Finished punnets must be > 0.")
         else:
-            rec = {
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "work_date": work_date.isoformat(),
-                "shift": shift.strip() if shift else None,
-                "line": line.strip() if line else None,
-                "pack_type": None if pack_type == "(blank)" else pack_type,
-                "minutes": float(minutes),
-                "people": float(people),
-                "finished_punnets": float(finished_punnets),
-                "waste_punnets": float(waste_punnets),
-                "downtime_minutes": float(downtime_minutes),
-                "note": note.strip() if note else None
-            }
+            # IMPORTANT: For number columns, never send "" (empty string), send 0 or omit
+            fields = {}
 
-            # Save local first
-            insert_record(rec)
+            title_val = build_title(work_date, safe_text(pack_type), safe_text(shift), safe_text(line))
+            fields[SP_COL_TITLE] = title_val
 
-            # Optional: push to SharePoint
-            if get_setting("sync_to_sharepoint", "0") == "1":
-                try:
-                    sp_push_record_to_list(rec)
-                    st.success("Saved ✅ (Local + SharePoint)")
-                except Exception as e:
-                    st.warning("Saved locally ✅ but SharePoint push failed.")
-                    st.error(str(e))
-            else:
-                st.success("Saved ✅ (Local only)")
+            # date column: send YYYY-MM-DD
+            fields[SP_COL_WORKDATE] = work_date.isoformat()
 
-            # quick result
-            hr = float(get_setting("hourly_rate", "0") or 0)
-            labour_hours = (minutes * people) / 60.0
-            pph = finished_punnets / labour_hours if labour_hours > 0 else 0
-            lcpp = (labour_hours * hr) / finished_punnets if finished_punnets > 0 else 0
+            if safe_text(shift):
+                fields[SP_COL_SHIFT] = safe_text(shift)
+            if safe_text(line):
+                fields[SP_COL_LINE] = safe_text(line)
+            if safe_text(pack_type):
+                fields[SP_COL_PACKTYPE] = safe_text(pack_type)
+            if safe_text(note):
+                fields[SP_COL_NOTE] = safe_text(note)
 
-            st.write("Quick result:")
-            st.metric("Labour hours", f"{labour_hours:.2f}")
-            st.metric("Punnets per labour hour", f"{pph:.1f}")
-            st.metric("Labour cost per punnet", f"${lcpp:.4f}")
+            fields[SP_COL_MINUTES] = to_number(minutes, 0)
+            fields[SP_COL_PEOPLE] = to_number(people, 0)
+            fields[SP_COL_FINISHED] = to_number(finished, 0)
 
-# ----------------------------
-# Tab 2: View & delete
-# ----------------------------
+            # optional numbers: send 0 if empty
+            fields[SP_COL_WASTE] = to_number(waste, 0)
+            fields[SP_COL_DOWNTIME] = to_number(downtime, 0)
+
+            try:
+                create_list_item(site_id, list_id, fields)
+                st.success("Saved ✅ (SharePoint item created)")
+
+                labour_hours = (minutes * people) / 60.0
+                pph = finished / labour_hours if labour_hours > 0 else 0
+                lcpp = (labour_hours * hourly_rate) / finished if finished > 0 else 0
+
+                st.write("Quick result:")
+                st.metric("Labour hours", f"{labour_hours:.2f}")
+                st.metric("Punnets per labour hour", f"{pph:.1f}")
+                st.metric("Labour cost per punnet", f"${lcpp:.4f}")
+            except Exception as e:
+                st.error(str(e))
+
+
+# -------------------------
+# Tab 2: View
+# -------------------------
 with tab2:
-    st.subheader("View records")
+    st.subheader("View records (read from SharePoint)")
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("Start date", value=date.today().replace(day=1))
     with c2:
         end = st.date_input("End date", value=date.today())
 
-    df = load_records(start, end)
-    df_calc = add_calculated_cols(df, float(get_setting("hourly_rate", "0") or 0))
+    try:
+        items = get_all_items(site_id, list_id, top=200)
+        df = items_to_df(items)
 
-    if df_calc.empty:
-        st.info("No data in this date range.")
-    else:
-        show_cols = [
-            "id", "work_date", "shift", "line", "pack_type",
-            "minutes", "people", "finished_punnets", "waste_punnets", "downtime_minutes",
-            "labour_hours", "punnets_per_labour_hour", "labour_cost_per_punnet",
-            "note", "created_at"
-        ]
-        st.dataframe(df_calc[show_cols], use_container_width=True)
+        if df.empty:
+            st.info("No items yet.")
+        else:
+            # filter locally (simple)
+            df = df[df[SP_COL_WORKDATE].between(start, end)]
+            df_calc = add_calculated_cols(df, hourly_rate)
 
-        st.divider()
-        st.write("Delete a record (careful):")
-        del_id = st.number_input("Record ID to delete", min_value=0, value=0, step=1)
-        if st.button("Delete"):
-            if del_id > 0:
-                delete_record(int(del_id))
-                st.success(f"Deleted ID {int(del_id)}")
-                st.rerun()
-            else:
-                st.warning("Please input a valid ID (>0).")
+            show_cols = [
+                "ItemId",
+                SP_COL_WORKDATE, SP_COL_SHIFT, SP_COL_LINE, SP_COL_PACKTYPE,
+                SP_COL_MINUTES, SP_COL_PEOPLE, SP_COL_FINISHED, SP_COL_WASTE, SP_COL_DOWNTIME,
+                "labour_hours", "punnets_per_labour_hour", "labour_cost_per_punnet",
+                SP_COL_NOTE, SP_COL_TITLE
+            ]
+            show_cols = [c for c in show_cols if c in df_calc.columns]
+            st.dataframe(df_calc[show_cols].sort_values(SP_COL_WORKDATE, ascending=False), use_container_width=True)
 
-# ----------------------------
+            st.caption("如果你想要删除 item，我也可以帮你加 Delete 功能（需要 Graph delete item endpoint）。")
+    except Exception as e:
+        st.error(str(e))
+
+
+# -------------------------
 # Tab 3: Export
-# ----------------------------
+# -------------------------
 with tab3:
     st.subheader("Export Excel report")
     c1, c2 = st.columns(2)
@@ -548,22 +399,30 @@ with tab3:
     with c2:
         ex_end = st.date_input("Export end date", value=date.today(), key="ex_end")
 
-    hourly_rate_now = float(get_setting("hourly_rate", "0") or 0)
-    df_raw = load_records(ex_start, ex_end)
-    df_raw_calc = add_calculated_cols(df_raw, hourly_rate_now)
-    df_summary = make_summary(df_raw, hourly_rate_now)
+    try:
+        items = get_all_items(site_id, list_id, top=500)
+        df_raw = items_to_df(items)
 
-    if df_raw.empty:
-        st.info("No data to export.")
-    else:
-        st.write("Preview (Summary):")
-        st.dataframe(df_summary, use_container_width=True)
+        if df_raw.empty:
+            st.info("No data to export.")
+        else:
+            df_raw = df_raw[df_raw[SP_COL_WORKDATE].between(ex_start, ex_end)]
+            if df_raw.empty:
+                st.info("No data in this date range.")
+            else:
+                df_raw_calc = add_calculated_cols(df_raw, hourly_rate)
+                df_summary = make_summary(df_raw, hourly_rate)
 
-        file_bytes = to_excel_bytes(df_raw_calc, df_summary)
-        fname = f"packing_report_{ex_start.isoformat()}_to_{ex_end.isoformat()}.xlsx"
-        st.download_button(
-            label="Download Excel report",
-            data=file_bytes,
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+                st.write("Preview (Summary):")
+                st.dataframe(df_summary, use_container_width=True)
+
+                file_bytes = to_excel_bytes(df_raw_calc, df_summary)
+                fname = f"packing_report_{ex_start.isoformat()}_to_{ex_end.isoformat()}.xlsx"
+                st.download_button(
+                    label="Download Excel report",
+                    data=file_bytes,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+    except Exception as e:
+        st.error(str(e))
