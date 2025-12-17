@@ -1,91 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 import time
-import requests
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
+import requests
 import streamlit as st
 
-# =========================================================
-# REQUIRED SECRETS (st.secrets)
-# TENANT_ID, CLIENT_ID, CLIENT_SECRET
-# SP_HOST (e.g. "yourtenant.sharepoint.com")
-# SP_SITE_PATH (e.g. "/sites/HealthyFresh")
-# =========================================================
 
 # =========================================================
-# LIST NAMES (SharePoint displayName)
-# =========================================================
-LIST_P_BATCHES = "P_Batches"
-LIST_P_LABOUR = "P_LabourLines"
-LIST_PACKTYPES = "M_PackTypes"   # you created
-LIST_PRODUCTS = "Products"
-
-# =========================================================
-# P_Batches column internal names (match your SP columns)
-# =========================================================
-B_COL_BATCHNO = "Title"              # BatchNo stored in Title
-B_COL_WORKDATE = "WorkDate"
-
-# Inputs (from your template fields)
-B_COL_TOTALBOXES = "TotalBoxes"
-B_COL_CTPERBOX = "CtPerBox"
-B_COL_LOOSECT = "LooseCT"
-
-B_COL_TOTALRAW = "TotalRawMaterial"
-B_COL_RAWUNIT = "RawMaterialUnit"
-B_COL_UNITWEIGHTKG = "MaterialUnitWeightKg"
-
-B_COL_WASTAGE = "Wastage"
-B_COL_WASTAGEUNIT = "WastageUnit"
-
-B_COL_WAGEPERHOUR = "WagePerHour"
-B_COL_MATERIALCOST = "MaterialCost"
-
-B_COL_INCLUDEEXTRA = "IncludeExtraCost"
-B_COL_EXTRAPCT = "ExtraCostPct"
-B_COL_EXTRADESC = "ExtraCostDescription"
-
-B_COL_SELLPRICE = "SellPricePerCT"
-
-# Lookups (optional; depends how you named)
-B_COL_PRODUCT = "ProductName"   # lookup to Products (yours)
-B_COL_PACKTYPE = "PackType"     # lookup to M_PackTypes (you added)
-
-# Outputs (to write back)
-B_OUT_TOTALOUTPUTCT = "TotalOutputCT"
-B_OUT_TOTALMANMIN = "TotalManMinutes"
-B_OUT_MINPERCT = "MinutesPerCT"
-B_OUT_WASTAGERATE = "WastageRate"
-B_OUT_LABOURCOST = "LabourCostPerCT"
-B_OUT_MATERIALCOST = "MaterialCostPerCT"
-B_OUT_EXTRACOST = "ExtraCostPerCT"
-B_OUT_TOTALCOST = "TotalCostPerCT"
-B_OUT_PROFITPERCT = "ProfitPerCT"
-B_OUT_PROFITTOTAL = "ProfitTotal"
-
-# =========================================================
-# P_LabourLines columns
-# =========================================================
-L_COL_BATCH = "Batch"           # lookup to P_Batches
-L_COL_START = "StartTime"
-L_COL_END = "EndTime"
-L_COL_PEOPLE = "People"
-L_COL_DURATION = "DurationMinutes"  # optional calc col in SP
-L_COL_MANMIN = "ManMinutes"         # optional calc col in SP
-
-# =========================================================
-# M_PackTypes columns
-# =========================================================
-PT_COL_TITLE = "Title"
-PT_COL_PRODUCT = "Product"              # lookup to Products (if you made)
-PT_COL_CTPERBOX = "CtPerBox"
-PT_COL_PACKWEIGHTKG = "PackUnitWeightKg"  # 0.7, 0.5 etc
-PT_COL_SELLDEFAULT = "SellPricePerCTDefault"
-PT_COL_ACTIVE = "Active"
-
-# =========================================================
-# Helpers
+# Secrets helpers
 # =========================================================
 def secrets_get(key: str, default=None):
     try:
@@ -93,67 +19,6 @@ def secrets_get(key: str, default=None):
     except Exception:
         return default
 
-def _to_float(v, default=0.0) -> float:
-    try:
-        if v is None or v == "":
-            return float(default)
-        if isinstance(v, bool):
-            return 1.0 if v else 0.0
-        return float(v)
-    except Exception:
-        return float(default)
-
-def _to_bool(v, default=False) -> bool:
-    if v is None or v == "":
-        return bool(default)
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in ["1", "true", "yes", "y"]:
-        return True
-    if s in ["0", "false", "no", "n"]:
-        return False
-    return bool(default)
-
-def _to_text(v) -> str:
-    if v is None:
-        return ""
-    return str(v)
-
-def _parse_date(v):
-    if not v:
-        return None
-    s = str(v).strip()
-    try:
-        if "T" in s:
-            return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
-        if "-" in s and len(s) >= 10:
-            return datetime.strptime(s[:10], "%Y-%m-%d").date()
-        if "/" in s:
-            # mm/dd/yyyy
-            return datetime.strptime(s, "%m/%d/%Y").date()
-    except Exception:
-        return None
-    return None
-
-def _parse_dt(v):
-    if not v:
-        return None
-    s = str(v).strip()
-    try:
-        if "T" in s:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        # fallback
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-def _get_lookup_id(fields: dict, base: str):
-    # Graph usually provides <ColName>LookupId for lookup columns
-    k = f"{base}LookupId"
-    if k in fields:
-        return fields.get(k)
-    return None
 
 # =========================================================
 # Graph auth (client credentials)
@@ -162,6 +27,7 @@ def graph_get_token() -> str:
     tenant = secrets_get("TENANT_ID", "")
     client_id = secrets_get("CLIENT_ID", "")
     client_secret = secrets_get("CLIENT_SECRET", "")
+
     if not tenant or not client_id or not client_secret:
         raise Exception("Missing secrets: TENANT_ID / CLIENT_ID / CLIENT_SECRET")
 
@@ -184,15 +50,21 @@ def graph_get_token() -> str:
     js = r.json()
     token = js.get("access_token", "")
     if not token:
-        raise Exception(f"Token empty. Raw: {r.text}")
+        raise Exception(f"Token is empty. Raw response: {r.text}")
 
     expires_in = int(js.get("expires_in", 3600))
     st.session_state["_graph_token_cache"] = {"access_token": token, "expires_at": now + expires_in}
     return token
 
-def graph_headers() -> dict:
-    return {"Authorization": f"Bearer {graph_get_token()}", "Content-Type": "application/json"}
 
+def graph_headers() -> dict:
+    token = graph_get_token()
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+# =========================================================
+# Graph: site / list ids
+# =========================================================
 def graph_get_site_id(host: str, site_path: str) -> str:
     url = f"https://graph.microsoft.com/v1.0/sites/{host}:{site_path}"
     r = requests.get(url, headers=graph_headers(), timeout=30)
@@ -203,11 +75,13 @@ def graph_get_site_id(host: str, site_path: str) -> str:
         raise Exception(f"Site id empty. Raw: {r.text}")
     return site_id
 
+
 def graph_get_list_id(site_id: str, list_name: str) -> str:
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists?$top=200"
     r = requests.get(url, headers=graph_headers(), timeout=30)
     if r.status_code != 200:
         raise Exception(f"Get lists failed: {r.status_code} {r.text}")
+
     for it in r.json().get("value", []):
         if it.get("displayName") == list_name:
             list_id = it.get("id", "")
@@ -215,7 +89,8 @@ def graph_get_list_id(site_id: str, list_name: str) -> str:
                 return list_id
     raise Exception(f"List not found: {list_name}")
 
-def get_site_and_list_id(list_name: str):
+
+def get_site_id() -> str:
     host = secrets_get("SP_HOST", "")
     site_path = secrets_get("SP_SITE_PATH", "")
     if not host or not site_path:
@@ -225,19 +100,26 @@ def get_site_and_list_id(list_name: str):
     if not site_id:
         site_id = graph_get_site_id(host, site_path)
         st.session_state["_sp_site_id"] = site_id
+    return site_id
 
+
+def get_list_id_cached(list_name: str) -> str:
+    site_id = get_site_id()
     cache = st.session_state.get("_sp_list_ids", {})
     if list_name in cache:
-        return site_id, cache[list_name]
-
+        return cache[list_name]
     list_id = graph_get_list_id(site_id, list_name)
     cache[list_name] = list_id
     st.session_state["_sp_list_ids"] = cache
-    return site_id, list_id
+    return list_id
 
-def graph_list_items_all(site_id: str, list_id: str, top: int = 2000) -> list[dict]:
+
+# =========================================================
+# Graph: list items read (auto paging)
+# =========================================================
+def graph_list_items_all(site_id: str, list_id: str, top: int = 2000) -> List[Dict[str, Any]]:
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?$expand=fields&$top={top}"
-    out = []
+    out: List[Dict[str, Any]] = []
     while url:
         r = requests.get(url, headers=graph_headers(), timeout=30)
         if r.status_code != 200:
@@ -247,257 +129,348 @@ def graph_list_items_all(site_id: str, list_id: str, top: int = 2000) -> list[di
         url = js.get("@odata.nextLink")
     return out
 
-def graph_patch_item_fields(site_id: str, list_id: str, item_id: str, fields_patch: dict):
+
+def graph_patch_item_fields(site_id: str, list_id: str, item_id: str, fields_patch: Dict[str, Any]) -> None:
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
-    r = requests.patch(url, headers=graph_headers(), json=fields_patch, timeout=30)
+    r = requests.patch(url, headers=graph_headers(), data=json.dumps(fields_patch), timeout=30)
     if r.status_code not in (200, 204):
-        raise Exception(f"PATCH failed: {r.status_code} {r.text}")
+        raise Exception(f"PATCH fields failed: {r.status_code} {r.text}")
+
+
+# =========================================================
+# parsing helpers
+# =========================================================
+def _to_float(v, default=0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _to_int(v, default=0) -> int:
+    try:
+        if v is None or v == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _to_text(v) -> str:
+    if v is None:
+        return ""
+    return str(v)
+
+
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    return s in ("true", "yes", "y", "1", "on")
+
+
+def _parse_date(v) -> Optional[date]:
+    if not v:
+        return None
+    s = str(v).strip()
+    try:
+        if "T" in s:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+        if "-" in s and len(s) >= 10:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+        if "/" in s:
+            # SharePoint sometimes mm/dd/yyyy
+            return datetime.strptime(s, "%m/%d/%Y").date()
+    except Exception:
+        return None
+    return None
+
+
+def _parse_dt(v) -> Optional[datetime]:
+    if not v:
+        return None
+    s = str(v).strip()
+    try:
+        if "T" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt
+        # fallback: try common
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _get_any(fields: Dict[str, Any], keys: List[str], default=None):
+    for k in keys:
+        if k in fields and fields.get(k) not in (None, ""):
+            return fields.get(k)
+    return default
+
+
+# =========================================================
+# List names
+# =========================================================
+LIST_P_BATCHES = secrets_get("SP_LIST_P_BATCHES", "P_Batches")
+LIST_P_LABOUR = secrets_get("SP_LIST_P_LABOURLINES", "P_LabourLines")
+LIST_PRODUCTS = secrets_get("SP_LIST_PRODUCTS", "Products")  # optional
+
+
+# =========================================================
+# Column names (try to be robust)
+# =========================================================
+# P_Batches (inputs)
+COL_BATCHNO = ["BatchNo", "Title"]
+COL_WORKDATE = ["WorkDate"]
+COL_PACKTYPE = ["PackType"]
+
+COL_TOTALBOXES = ["TotalBoxes"]
+COL_CTPERBOX = ["CtPerBox"]
+COL_LOOSECT = ["LooseCT"]
+
+COL_TOTALRAW = ["TotalRawMaterial"]
+COL_RAWUNIT = ["RawMaterialUnit"]
+COL_UNITWEIGHT = ["MaterialUnitWeightKg"]
+
+COL_WASTAGE = ["Wastage"]
+COL_WASTAGEUNIT = ["WastageUnit"]
+
+COL_WAGEPH = ["WagePerHour"]
+COL_MATERIALCOST = ["MaterialCost"]
+
+COL_INCLUDEEXTRA = ["IncludeExtraCost", "IncludeExtraCost1", "IncludeExtraCost2"]
+COL_EXTRAPCT = ["ExtraCostPct", "ExtraCostPercentage", "OverheadPct", "OverheadPctDefault"]
+COL_SELLPRICE = ["SellPricePerCT", "SellPricePerCt", "SellPricePerCT1"]
+
+# P_Batches (outputs you added)
+OUT_TOTALOUTPUT = "TotalOutputCT"
+OUT_TOTALMANMIN = "TotalManMinutes"
+OUT_MINPERCT = "MinutesPerCT"
+OUT_WASTERATE = "WastageRatePct"
+OUT_LABOURCOST = "LabourCostPerCT"
+OUT_MATCOST = "MaterialCostPerCT"
+OUT_EXTRACOST = "ExtraCostPerCT"
+OUT_TOTALCOST = "TotalCostPerCT"
+OUT_PROFITPERCT = "ProfitPerCT"
+OUT_PROFITTOTAL = "ProfitTotal"
+
+# optional debug/storage
+OUT_RAWKG = "RawKg"
+OUT_WASTAGEKG = "WastageKg"
+OUT_CALCAT = "CalculatedAt"
+
+# P_LabourLines
+LAB_COL_BATCH_LOOKUP_ID = ["BatchLookupId"]  # best case
+LAB_COL_BATCH_TEXT = ["Batch", "BatchNo", "Title"]  # fallback
+LAB_COL_START = ["StartTime"]
+LAB_COL_END = ["EndTime"]
+LAB_COL_PEOPLE = ["People"]
+LAB_COL_ROLE = ["Role"]
+
+LAB_OUT_DURATION = "DurationMinutes"
+LAB_OUT_MANMIN = "ManMinutes"
+
 
 # =========================================================
 # Fetchers
 # =========================================================
-@st.cache_data(ttl=60)
-def fetch_packtypes_map() -> dict:
-    site_id, list_id = get_site_and_list_id(LIST_PACKTYPES)
-    items = graph_list_items_all(site_id, list_id, top=2000)
-    mp = {}
+def fetch_p_batches() -> List[Dict[str, Any]]:
+    site_id = get_site_id()
+    list_id = get_list_id_cached(LIST_P_BATCHES)
+    return graph_list_items_all(site_id, list_id, top=2000)
+
+
+def fetch_labour_lines() -> List[Dict[str, Any]]:
+    site_id = get_site_id()
+    list_id = get_list_id_cached(LIST_P_LABOUR)
+    return graph_list_items_all(site_id, list_id, top=2000)
+
+
+def fetch_products_map() -> Dict[str, Dict[str, Any]]:
+    """
+    key by ProductName or Title; value is fields dict.
+    optional only (if list exists)
+    """
+    try:
+        site_id = get_site_id()
+        list_id = get_list_id_cached(LIST_PRODUCTS)
+        items = graph_list_items_all(site_id, list_id, top=4000)
+    except Exception:
+        return {}
+
+    mp: Dict[str, Dict[str, Any]] = {}
     for it in items:
         f = it.get("fields") or {}
-        title = _to_text(f.get(PT_COL_TITLE))
-        if not title:
-            continue
-        active = _to_bool(f.get(PT_COL_ACTIVE), True)
-        mp[title] = {
-            "active": active,
-            "ct_per_box": _to_float(f.get(PT_COL_CTPERBOX), 0),
-            "pack_weight_kg": _to_float(f.get(PT_COL_PACKWEIGHTKG), 0),
-            "sell_default": _to_float(f.get(PT_COL_SELLDEFAULT), 0),
-        }
+        name = _get_any(f, ["ProductName", "Title"], "")
+        if name:
+            mp[str(name)] = f
     return mp
 
-def fetch_batches_df(start: date, end: date) -> pd.DataFrame:
-    site_id, list_id = get_site_and_list_id(LIST_P_BATCHES)
-    items = graph_list_items_all(site_id, list_id, top=2000)
-    rows = []
-    for it in items:
-        f = it.get("fields") or {}
-        wd = _parse_date(f.get(B_COL_WORKDATE))
-        if not wd:
-            continue
-        if wd < start or wd > end:
-            continue
-
-        rows.append({
-            "sp_item_id": it.get("id"),
-            "batch_no": _to_text(f.get(B_COL_BATCHNO)),
-            "work_date": wd,
-            "product_lookup_id": _get_lookup_id(f, B_COL_PRODUCT),
-            "packtype_lookup_id": _get_lookup_id(f, B_COL_PACKTYPE),
-            "pack_type": _to_text(f.get(B_COL_PACKTYPE)) or _to_text(f.get("PackType")),
-
-            "total_boxes": _to_float(f.get(B_COL_TOTALBOXES), 0),
-            "ct_per_box": _to_float(f.get(B_COL_CTPERBOX), 0),
-            "loose_ct": _to_float(f.get(B_COL_LOOSECT), 0),
-
-            "total_raw": _to_float(f.get(B_COL_TOTALRAW), 0),
-            "raw_unit": _to_text(f.get(B_COL_RAWUNIT)).lower(),
-            "unit_weight_kg": _to_float(f.get(B_COL_UNITWEIGHTKG), 0),
-
-            "wastage": _to_float(f.get(B_COL_WASTAGE), 0),
-            "wastage_unit": _to_text(f.get(B_COL_WASTAGEUNIT)).lower(),
-
-            "wage_per_hour": _to_float(f.get(B_COL_WAGEPERHOUR), 0),
-            "material_cost": _to_float(f.get(B_COL_MATERIALCOST), 0),
-
-            "include_extra": _to_bool(f.get(B_COL_INCLUDEEXTRA), False),
-            "extra_pct": _to_float(f.get(B_COL_EXTRAPCT), 0),
-            "sell_price_per_ct": _to_float(f.get(B_COL_SELLPRICE), 0),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df = df.sort_values(["work_date", "batch_no"], ascending=[False, True])
-    return df
-
-def fetch_labour_lines_df(batch_item_id: str) -> pd.DataFrame:
-    # We fetch all and filter in python (simple + safe)
-    site_id, list_id = get_site_and_list_id(LIST_P_LABOUR)
-    items = graph_list_items_all(site_id, list_id, top=2000)
-
-    rows = []
-    for it in items:
-        f = it.get("fields") or {}
-        # lookup to P_Batches
-        bid = _get_lookup_id(f, L_COL_BATCH)
-        if str(bid) != str(batch_item_id):
-            continue
-
-        start_dt = _parse_dt(f.get(L_COL_START))
-        end_dt = _parse_dt(f.get(L_COL_END))
-        people = _to_float(f.get(L_COL_PEOPLE), 0)
-
-        duration = _to_float(f.get(L_COL_DURATION), 0)
-        manmin = _to_float(f.get(L_COL_MANMIN), 0)
-
-        # if SP calculated columns not ready, compute here
-        if duration <= 0 and start_dt and end_dt:
-            duration = (end_dt - start_dt).total_seconds() / 60.0
-            if duration < 0:
-                # not handling cross-midnight yet
-                duration = 0
-
-        if manmin <= 0 and duration > 0 and people > 0:
-            manmin = duration * people
-
-        rows.append({
-            "sp_item_id": it.get("id"),
-            "start_time": start_dt,
-            "end_time": end_dt,
-            "people": people,
-            "duration_minutes": round(duration, 2),
-            "man_minutes": round(manmin, 2),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    return df.sort_values(["start_time"], ascending=[True])
 
 # =========================================================
-# Conversion + calculations (template logic)
+# Core logic: unit conversion + calculations
 # =========================================================
-def to_kg(qty: float, uom: str, kg_per_box: float, pack_unit_kg: float) -> float:
-    u = (uom or "").strip().lower()
-    if qty is None:
-        return 0.0
-    qty = float(qty)
+def normalize_unit(u: str) -> str:
+    s = (u or "").strip().lower()
+    s = s.replace(".", "")
+    return s
 
-    if u in ["kg", "kgs", "kilogram", "kilograms"]:
-        return qty
 
-    # treat carton/crate/box as "box-like"
-    if u in ["box", "boxes", "carton", "cartons", "crate", "crates"]:
-        return qty * float(kg_per_box or 0)
+def convert_to_kg(qty: float, unit: str, unit_weight_kg: float) -> float:
+    u = normalize_unit(unit)
 
-    # ct/pack: number of retail packs
-    if u in ["ct", "count", "pack", "packs"]:
-        return qty * float(pack_unit_kg or 0)
+    # kg directly
+    if u in ("kg", "kgs", "kilogram", "kilograms"):
+        return float(qty)
 
-    # loose: usually already kg; if not, we still treat as kg to avoid blocking
-    if u in ["loose", ""]:
-        return qty
+    # common “unit-count” type -> multiply by unit weight
+    if u in ("box", "boxes", "carton", "cartons", "crate", "crates", "ctn", "ctns"):
+        return float(qty) * float(unit_weight_kg)
 
-    # unknown -> assume kg (safe default)
-    return qty
+    # loose: usually user already gives kg, but sometimes they write “loose” with kg value
+    if u in ("loose", "loosekg", "bulk"):
+        return float(qty)
 
-def calc_template(batch_row: dict, labour_df: pd.DataFrame, packtype_info: dict | None) -> dict:
-    total_boxes = float(batch_row.get("total_boxes", 0))
-    ct_per_box = float(batch_row.get("ct_per_box", 0))
-    loose_ct = float(batch_row.get("loose_ct", 0))
+    # pack: if they put pack but qty is already kg, keep it
+    if u in ("pack", "packs", "pkt", "pkts"):
+        # if unit_weight_kg exists, treat as qty * unit_weight_kg, else assume kg
+        if unit_weight_kg and unit_weight_kg > 0:
+            return float(qty) * float(unit_weight_kg)
+        return float(qty)
 
-    total_raw = float(batch_row.get("total_raw", 0))
-    raw_unit = (batch_row.get("raw_unit") or "").lower()
-    unit_weight_kg = float(batch_row.get("unit_weight_kg", 0))
+    # fallback: assume kg
+    return float(qty)
 
-    wastage = float(batch_row.get("wastage", 0))
-    wastage_unit = (batch_row.get("wastage_unit") or "").lower()
 
-    wage_per_hour = float(batch_row.get("wage_per_hour", 0))
-    material_cost = float(batch_row.get("material_cost", 0))
-    include_extra = bool(batch_row.get("include_extra", False))
-    extra_pct = float(batch_row.get("extra_pct", 0))
-    sell_price_per_ct = float(batch_row.get("sell_price_per_ct", 0))
+def calc_for_batch(batch_fields: Dict[str, Any], labour_items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    # ---- Inputs
+    total_boxes = _to_float(_get_any(batch_fields, COL_TOTALBOXES, 0), 0)
+    ct_per_box = _to_float(_get_any(batch_fields, COL_CTPERBOX, 0), 0)
+    loose_ct = _to_float(_get_any(batch_fields, COL_LOOSECT, 0), 0)
 
-    # packtype defaults (if provided)
-    pack_unit_kg = 0.0
-    if packtype_info:
-        if ct_per_box <= 0 and packtype_info.get("ct_per_box", 0) > 0:
-            ct_per_box = float(packtype_info["ct_per_box"])
-        pack_unit_kg = float(packtype_info.get("pack_weight_kg", 0))
-        if sell_price_per_ct <= 0 and packtype_info.get("sell_default", 0) > 0:
-            sell_price_per_ct = float(packtype_info["sell_default"])
+    total_raw = _to_float(_get_any(batch_fields, COL_TOTALRAW, 0), 0)
+    raw_unit = _to_text(_get_any(batch_fields, COL_RAWUNIT, ""))
+    unit_weight_kg = _to_float(_get_any(batch_fields, COL_UNITWEIGHT, 0), 0)
 
-    # OUTPUT
+    wastage = _to_float(_get_any(batch_fields, COL_WASTAGE, 0), 0)
+    wastage_unit = _to_text(_get_any(batch_fields, COL_WASTAGEUNIT, "kg"))
+
+    wage_per_hour = _to_float(_get_any(batch_fields, COL_WAGEPH, 0), 0)
+    material_cost = _to_float(_get_any(batch_fields, COL_MATERIALCOST, 0), 0)
+
+    include_extra = _to_bool(_get_any(batch_fields, COL_INCLUDEEXTRA, False))
+    extra_pct = _to_float(_get_any(batch_fields, COL_EXTRAPCT, 0), 0)
+
+    sell_price_per_ct = _to_float(_get_any(batch_fields, COL_SELLPRICE, 0), 0)
+
+    # ---- Output CT
     total_output_ct = total_boxes * ct_per_box + loose_ct
 
-    # LABOUR
-    total_man_minutes = float(labour_df["man_minutes"].sum()) if not labour_df.empty else 0.0
+    # ---- Labour lines compute
+    labour_rows: List[Dict[str, Any]] = []
+    total_man_minutes = 0.0
+
+    for it in labour_items:
+        f = it.get("fields") or {}
+        start_dt = _parse_dt(_get_any(f, LAB_COL_START, None))
+        end_dt = _parse_dt(_get_any(f, LAB_COL_END, None))
+        people = _to_float(_get_any(f, LAB_COL_PEOPLE, 0), 0)
+
+        duration_minutes = 0.0
+        if start_dt and end_dt:
+            # if no tz info, assume UTC
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+            if end_dt < start_dt:
+                end_dt = end_dt + timedelta(days=1)
+
+            duration_minutes = (end_dt - start_dt).total_seconds() / 60.0
+            if duration_minutes < 0:
+                duration_minutes = 0.0
+
+        man_minutes = duration_minutes * people
+        total_man_minutes += man_minutes
+
+        labour_rows.append({
+            "sp_item_id": it.get("id"),
+            "start_time": start_dt.isoformat() if start_dt else "",
+            "end_time": end_dt.isoformat() if end_dt else "",
+            "people": people,
+            "duration_minutes": round(duration_minutes, 2),
+            "man_minutes": round(man_minutes, 2),
+            "role": _to_text(_get_any(f, LAB_COL_ROLE, "")),
+        })
+
     minutes_per_ct = (total_man_minutes / total_output_ct) if total_output_ct > 0 else 0.0
 
-    # WASTAGE RATE (convert to kg base)
-    raw_kg = to_kg(total_raw, raw_unit, unit_weight_kg, pack_unit_kg)
-    wastage_kg = to_kg(wastage, wastage_unit, unit_weight_kg, pack_unit_kg)
-    wastage_rate = (wastage_kg / raw_kg * 100.0) if raw_kg > 0 else 0.0
+    # ---- Unit conversion
+    raw_kg = convert_to_kg(total_raw, raw_unit, unit_weight_kg)
+    wastage_kg = convert_to_kg(wastage, wastage_unit, unit_weight_kg)
 
-    # COSTS
-    labour_cost_per_ct = (wage_per_hour / 60.0) * minutes_per_ct if wage_per_hour > 0 else 0.0
+    wastage_rate_pct = (wastage_kg / raw_kg * 100.0) if raw_kg > 0 else 0.0
+
+    # ---- Costs
+    labour_cost_per_ct = (minutes_per_ct * (wage_per_hour / 60.0)) if total_output_ct > 0 else 0.0
     material_cost_per_ct = (material_cost / total_output_ct) if total_output_ct > 0 else 0.0
 
-    base_cost = labour_cost_per_ct + material_cost_per_ct
-    extra_cost_per_ct = (base_cost * extra_pct / 100.0) if include_extra and extra_pct > 0 else 0.0
+    base_cost_per_ct = labour_cost_per_ct + material_cost_per_ct
 
-    total_cost_per_ct = base_cost + extra_cost_per_ct
+    extra_cost_per_ct = (base_cost_per_ct * (extra_pct / 100.0)) if include_extra else 0.0
+    total_cost_per_ct = base_cost_per_ct + extra_cost_per_ct
 
-    # PROFIT
     profit_per_ct = sell_price_per_ct - total_cost_per_ct
     profit_total = profit_per_ct * total_output_ct
 
-    return {
-        "TotalOutputCT": round(total_output_ct, 4),
-        "TotalManMinutes": round(total_man_minutes, 4),
-        "MinutesPerCT": round(minutes_per_ct, 4),
-        "WastageRate": round(wastage_rate, 4),
-        "LabourCostPerCT": round(labour_cost_per_ct, 4),
-        "MaterialCostPerCT": round(material_cost_per_ct, 4),
-        "ExtraCostPerCT": round(extra_cost_per_ct, 4),
-        "TotalCostPerCT": round(total_cost_per_ct, 4),
-        "ProfitPerCT": round(profit_per_ct, 4),
-        "ProfitTotal": round(profit_total, 4),
-        "SellPricePerCT_used": round(sell_price_per_ct, 4),
-        "CtPerBox_used": round(ct_per_box, 4),
-        "PackUnitWeightKg_used": round(pack_unit_kg, 4),
-        "RawKg": round(raw_kg, 4),
-        "WastageKg": round(wastage_kg, 4),
+    calc = {
+        OUT_TOTALOUTPUT: round(total_output_ct, 4),
+        OUT_TOTALMANMIN: round(total_man_minutes, 4),
+        OUT_MINPERCT: round(minutes_per_ct, 4),
+        OUT_WASTERATE: round(wastage_rate_pct, 4),
+        OUT_LABOURCOST: round(labour_cost_per_ct, 4),
+        OUT_MATCOST: round(material_cost_per_ct, 4),
+        OUT_EXTRACOST: round(extra_cost_per_ct, 4),
+        OUT_TOTALCOST: round(total_cost_per_ct, 4),
+        OUT_PROFITPERCT: round(profit_per_ct, 4),
+        OUT_PROFITTOTAL: round(profit_total, 4),
+
+        # optional
+        OUT_RAWKG: round(raw_kg, 4),
+        OUT_WASTAGEKG: round(wastage_kg, 4),
+        OUT_CALCAT: datetime.now(timezone.utc).isoformat(),
     }
 
-def save_results_to_batch(batch_item_id: str, calc: dict):
-    site_id, list_id = get_site_and_list_id(LIST_P_BATCHES)
-    patch = {
-        B_OUT_TOTALOUTPUTCT: calc["TotalOutputCT"],
-        B_OUT_TOTALMANMIN: calc["TotalManMinutes"],
-        B_OUT_MINPERCT: calc["MinutesPerCT"],
-        B_OUT_WASTAGERATE: calc["WastageRate"],
-        B_OUT_LABOURCOST: calc["LabourCostPerCT"],
-        B_OUT_MATERIALCOST: calc["MaterialCostPerCT"],
-        B_OUT_EXTRACOST: calc["ExtraCostPerCT"],
-        B_OUT_TOTALCOST: calc["TotalCostPerCT"],
-        B_OUT_PROFITPERCT: calc["ProfitPerCT"],
-        B_OUT_PROFITTOTAL: calc["ProfitTotal"],
-    }
-    graph_patch_item_fields(site_id, list_id, batch_item_id, patch)
+    return calc, labour_rows
+
 
 # =========================================================
 # UI
 # =========================================================
 st.set_page_config(page_title="Batch Calculator (SharePoint)", layout="wide")
-st.title("Batch Calculator — same logic as your template (SharePoint)")
+st.title("Batch Calculator — same logic as your template")
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("Read P_Batches + P_LabourLines, calculate, then write results back to P_Batches.")
+    st.caption("这版：P_Batches + P_LabourLines 自动计算 + 写回 SharePoint")
     if st.button("Test Graph connection"):
         try:
-            _ = graph_get_token()
-            st.success("Graph token OK")
-            _ = get_site_and_list_id(LIST_P_BATCHES)
-            _ = get_site_and_list_id(LIST_P_LABOUR)
-            _ = get_site_and_list_id(LIST_PACKTYPES)
-            st.success("Lists OK")
+            token = graph_get_token()
+            st.success(f"Token OK (len={len(token)})")
+            site_id = get_site_id()
+            st.success(f"Site OK: {site_id[:30]}...")
+            lb = get_list_id_cached(LIST_P_BATCHES)
+            st.success(f"P_Batches OK: {lb[:30]}...")
+            ll = get_list_id_cached(LIST_P_LABOUR)
+            st.success(f"P_LabourLines OK: {ll[:30]}...")
         except Exception as e:
             st.error(str(e))
 
-# Date range
+# date range + load
 c1, c2, c3 = st.columns([2, 2, 1])
 with c1:
     start_date = st.date_input("Start date", value=date.today().replace(day=1))
@@ -507,97 +480,201 @@ with c3:
     load_btn = st.button("Load / Refresh")
 
 if load_btn:
-    st.session_state.pop("_batches_df", None)
+    st.session_state.pop("_cache_batches", None)
+    st.session_state.pop("_cache_labour", None)
+    st.session_state.pop("_cache_products", None)
 
-batches_df = st.session_state.get("_batches_df")
-if batches_df is None:
+# load caches
+if st.session_state.get("_cache_batches") is None:
     try:
-        batches_df = fetch_batches_df(start_date, end_date)
-        st.session_state["_batches_df"] = batches_df
+        batches_items = fetch_p_batches()
+        st.session_state["_cache_batches"] = batches_items
     except Exception as e:
         st.error(str(e))
-        batches_df = pd.DataFrame()
+        batches_items = []
+else:
+    batches_items = st.session_state.get("_cache_batches")
 
-if batches_df.empty:
-    st.info("No batches in this date range (from P_Batches).")
+if st.session_state.get("_cache_labour") is None:
+    try:
+        labour_items_all = fetch_labour_lines()
+        st.session_state["_cache_labour"] = labour_items_all
+    except Exception as e:
+        st.error(str(e))
+        labour_items_all = []
+else:
+    labour_items_all = st.session_state.get("_cache_labour")
+
+# optional products (not required for calc, but future-proof)
+if st.session_state.get("_cache_products") is None:
+    st.session_state["_cache_products"] = fetch_products_map()
+products_map = st.session_state.get("_cache_products", {})
+
+# filter batches by WorkDate
+filtered_batches: List[Dict[str, Any]] = []
+for it in batches_items:
+    f = it.get("fields") or {}
+    wd = _parse_date(_get_any(f, COL_WORKDATE, None))
+    if not wd:
+        continue
+    if wd < start_date or wd > end_date:
+        continue
+    filtered_batches.append(it)
+
+# build dropdown options
+batch_options: List[Tuple[str, str]] = []  # (label, item_id)
+for it in filtered_batches:
+    f = it.get("fields") or {}
+    bn = _get_any(f, COL_BATCHNO, "")
+    wd = _parse_date(_get_any(f, COL_WORKDATE, None))
+    label = f"{bn}".strip()
+    if wd:
+        label = f"{label}  ({wd.isoformat()})"
+    batch_options.append((label, str(it.get("id"))))
+
+if not batch_options:
+    st.info("No batches in this date range (P_Batches).")
     st.stop()
 
-# Batch selector
-batch_options = batches_df["batch_no"].tolist()
-selected_batch = st.selectbox("Select BatchNo", batch_options, index=0)
+selected_label = st.selectbox("Select BatchNo", options=[x[0] for x in batch_options], index=0)
+selected_item_id = dict(batch_options).get(selected_label)
 
-row = batches_df[batches_df["batch_no"] == selected_batch].iloc[0].to_dict()
-batch_item_id = str(row["sp_item_id"])
+# find selected batch item
+selected_batch_item = None
+for it in filtered_batches:
+    if str(it.get("id")) == str(selected_item_id):
+        selected_batch_item = it
+        break
 
-# PackType info
-packtypes = fetch_packtypes_map()
-packtype_name = (row.get("pack_type") or "").strip()
-packtype_info = packtypes.get(packtype_name) if packtype_name else None
+if not selected_batch_item:
+    st.error("Selected batch not found (unexpected).")
+    st.stop()
 
-# Labour lines
-labour_df = fetch_labour_lines_df(batch_item_id)
+batch_fields = selected_batch_item.get("fields") or {}
+batch_no = _get_any(batch_fields, COL_BATCHNO, "")
 
-# Calculate
-calc = calc_template(row, labour_df, packtype_info)
+# filter labour lines for this batch
+labour_for_batch: List[Dict[str, Any]] = []
+batch_lookup_id_int = _to_int(selected_item_id, 0)
 
-left, right = st.columns([1.2, 1])
+for it in labour_items_all:
+    f = it.get("fields") or {}
+
+    # best: match BatchLookupId == batch item id
+    lk = _to_int(_get_any(f, LAB_COL_BATCH_LOOKUP_ID, 0), 0)
+    if lk and lk == batch_lookup_id_int:
+        labour_for_batch.append(it)
+        continue
+
+    # fallback: match text
+    bt = _to_text(_get_any(f, LAB_COL_BATCH_TEXT, ""))
+    if bt and str(bt).strip() and str(bt).strip() == str(batch_no).strip():
+        labour_for_batch.append(it)
+
+# calculate
+calc, labour_rows = calc_for_batch(batch_fields, labour_for_batch)
+
+# show input + output
+left, right = st.columns(2)
 
 with left:
     st.subheader("Inputs (from P_Batches)")
-    show_inputs = {
-        "BatchNo": row.get("batch_no"),
-        "WorkDate": str(row.get("work_date")),
-        "PackType": packtype_name,
-        "TotalBoxes": row.get("total_boxes"),
-        "CtPerBox": row.get("ct_per_box"),
-        "LooseCT": row.get("loose_ct"),
-        "TotalRawMaterial": row.get("total_raw"),
-        "RawMaterialUnit": row.get("raw_unit"),
-        "MaterialUnitWeightKg": row.get("unit_weight_kg"),
-        "Wastage": row.get("wastage"),
-        "WastageUnit": row.get("wastage_unit"),
-        "WagePerHour": row.get("wage_per_hour"),
-        "MaterialCost": row.get("material_cost"),
-        "IncludeExtraCost": row.get("include_extra"),
-        "ExtraCostPct": row.get("extra_pct"),
-        "SellPricePerCT": row.get("sell_price_per_ct"),
+    # show only key inputs
+    inputs_preview = {
+        "BatchNo": batch_no,
+        "WorkDate": _to_text(_get_any(batch_fields, COL_WORKDATE, "")),
+        "PackType": _to_text(_get_any(batch_fields, COL_PACKTYPE, "")),
+        "TotalBoxes": _to_float(_get_any(batch_fields, COL_TOTALBOXES, 0), 0),
+        "CtPerBox": _to_float(_get_any(batch_fields, COL_CTPERBOX, 0), 0),
+        "LooseCT": _to_float(_get_any(batch_fields, COL_LOOSECT, 0), 0),
+        "TotalRawMaterial": _to_float(_get_any(batch_fields, COL_TOTALRAW, 0), 0),
+        "RawMaterialUnit": _to_text(_get_any(batch_fields, COL_RAWUNIT, "")),
+        "MaterialUnitWeightKg": _to_float(_get_any(batch_fields, COL_UNITWEIGHT, 0), 0),
+        "Wastage": _to_float(_get_any(batch_fields, COL_WASTAGE, 0), 0),
+        "WastageUnit": _to_text(_get_any(batch_fields, COL_WASTAGEUNIT, "")),
+        "WagePerHour": _to_float(_get_any(batch_fields, COL_WAGEPH, 0), 0),
+        "MaterialCost": _to_float(_get_any(batch_fields, COL_MATERIALCOST, 0), 0),
+        "IncludeExtraCost": _to_bool(_get_any(batch_fields, COL_INCLUDEEXTRA, False)),
+        "ExtraCostPct": _to_float(_get_any(batch_fields, COL_EXTRAPCT, 0), 0),
+        "SellPricePerCT": _to_float(_get_any(batch_fields, COL_SELLPRICE, 0), 0),
     }
-    st.json(show_inputs)
+    st.code(json.dumps(inputs_preview, indent=2, ensure_ascii=False), language="json")
 
     st.subheader("Labour lines (for this batch)")
-    if labour_df.empty:
-        st.warning("No labour lines found in P_LabourLines for this batch.")
+    if labour_rows:
+        df_lab = pd.DataFrame(labour_rows)
+        st.dataframe(df_lab[["start_time", "end_time", "people", "duration_minutes", "man_minutes", "role"]], use_container_width=True)
     else:
-        st.dataframe(
-            labour_df[["start_time", "end_time", "people", "duration_minutes", "man_minutes"]],
-            use_container_width=True
-        )
+        st.info("No labour lines found for this batch (P_LabourLines).")
 
 with right:
     st.subheader("Calculated (template logic)")
-    st.json({
-        "TotalOutputCT": calc["TotalOutputCT"],
-        "TotalManMinutes": calc["TotalManMinutes"],
-        "MinutesPerCT": calc["MinutesPerCT"],
-        "WastageRate(%)": calc["WastageRate"],
-        "LabourCostPerCT": calc["LabourCostPerCT"],
-        "MaterialCostPerCT": calc["MaterialCostPerCT"],
-        "ExtraCostPerCT": calc["ExtraCostPerCT"],
-        "TotalCostPerCT": calc["TotalCostPerCT"],
-        "ProfitPerCT": calc["ProfitPerCT"],
-        "ProfitTotal": calc["ProfitTotal"],
-    })
+    calc_preview = {
+        OUT_TOTALOUTPUT: calc[OUT_TOTALOUTPUT],
+        OUT_TOTALMANMIN: calc[OUT_TOTALMANMIN],
+        OUT_MINPERCT: calc[OUT_MINPERCT],
+        "WastageRate(%)": calc[OUT_WASTERATE],
+        OUT_LABOURCOST: calc[OUT_LABOURCOST],
+        OUT_MATCOST: calc[OUT_MATCOST],
+        OUT_EXTRACOST: calc[OUT_EXTRACOST],
+        OUT_TOTALCOST: calc[OUT_TOTALCOST],
+        OUT_PROFITPERCT: calc[OUT_PROFITPERCT],
+        OUT_PROFITTOTAL: calc[OUT_PROFITTOTAL],
+    }
+    st.code(json.dumps(calc_preview, indent=2, ensure_ascii=False), language="json")
 
-    st.caption("Extra debug (for unit conversion)")
-    st.write(f"CtPerBox used: {calc['CtPerBox_used']}")
-    st.write(f"PackUnitWeightKg used: {calc['PackUnitWeightKg_used']}")
-    st.write(f"RawKg: {calc['RawKg']}, WastageKg: {calc['WastageKg']}")
-    st.write(f"SellPricePerCT used: {calc['SellPricePerCT_used']}")
+    st.caption("Extra debug (unit conversion)")
+    st.write(f"RawKg: {calc.get(OUT_RAWKG, 0)}, WastageKg: {calc.get(OUT_WASTAGEKG, 0)}")
 
-    if st.button("Calculate + Save to P_Batches"):
+    # buttons
+    save_cols = st.columns([2, 1])
+    with save_cols[0]:
+        do_save = st.button("Calculate + Save to P_Batches", type="primary")
+    with save_cols[1]:
+        write_labour_back = st.checkbox("Also write labour Duration/ManMinutes", value=True)
+
+    if do_save:
         try:
-            save_results_to_batch(batch_item_id, calc)
-            st.success("Saved ✅ (results written back to P_Batches)")
+            site_id = get_site_id()
+            pb_list_id = get_list_id_cached(LIST_P_BATCHES)
+            pl_list_id = get_list_id_cached(LIST_P_LABOUR)
+
+            # patch batch outputs
+            patch_fields = {
+                OUT_TOTALOUTPUT: calc[OUT_TOTALOUTPUT],
+                OUT_TOTALMANMIN: calc[OUT_TOTALMANMIN],
+                OUT_MINPERCT: calc[OUT_MINPERCT],
+                OUT_WASTERATE: calc[OUT_WASTERATE],
+                OUT_LABOURCOST: calc[OUT_LABOURCOST],
+                OUT_MATCOST: calc[OUT_MATCOST],
+                OUT_EXTRACOST: calc[OUT_EXTRACOST],
+                OUT_TOTALCOST: calc[OUT_TOTALCOST],
+                OUT_PROFITPERCT: calc[OUT_PROFITPERCT],
+                OUT_PROFITTOTAL: calc[OUT_PROFITTOTAL],
+            }
+
+            # optional fields: only patch if your list has them (if not, it might error)
+            # 你说你也加了，可直接开着
+            patch_fields[OUT_RAWKG] = calc.get(OUT_RAWKG, 0)
+            patch_fields[OUT_WASTAGEKG] = calc.get(OUT_WASTAGEKG, 0)
+            patch_fields[OUT_CALCAT] = calc.get(OUT_CALCAT, "")
+
+            graph_patch_item_fields(site_id, pb_list_id, str(selected_item_id), patch_fields)
+
+            # patch labour lines duration + manminutes
+            if write_labour_back and labour_rows:
+                for row in labour_rows:
+                    li_id = str(row["sp_item_id"])
+                    graph_patch_item_fields(
+                        site_id,
+                        pl_list_id,
+                        li_id,
+                        {
+                            LAB_OUT_DURATION: row["duration_minutes"],
+                            LAB_OUT_MANMIN: row["man_minutes"],
+                        }
+                    )
+
+            st.success("Saved ✅ (P_Batches outputs updated)")
         except Exception as e:
-            st.error("Save failed. Usually means output columns not created yet or internal name mismatch.")
             st.error(str(e))
