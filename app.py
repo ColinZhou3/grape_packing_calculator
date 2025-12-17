@@ -211,17 +211,13 @@ def _get_any(fields: Dict[str, Any], keys: List[str], default=None):
     return default
 
 
-# =========================================================
 # List names
-# =========================================================
 LIST_P_BATCHES = secrets_get("SP_LIST_P_BATCHES", "P_Batches")
 LIST_P_LABOUR = secrets_get("SP_LIST_P_LABOURLINES", "P_LabourLines")
 LIST_PRODUCTS = secrets_get("SP_LIST_PRODUCTS", "Products")  # optional
 
 
-# =========================================================
 # Column names (try to be robust)
-# =========================================================
 # P_Batches (inputs)
 COL_BATCHNO = ["BatchNo", "Title"]
 COL_WORKDATE = ["WorkDate"]
@@ -274,9 +270,7 @@ LAB_OUT_DURATION = "DurationMinutes"
 LAB_OUT_MANMIN = "ManMinutes"
 
 
-# =========================================================
 # Fetchers
-# =========================================================
 def fetch_p_batches() -> List[Dict[str, Any]]:
     site_id = get_site_id()
     list_id = get_list_id_cached(LIST_P_BATCHES)
@@ -310,9 +304,7 @@ def fetch_products_map() -> Dict[str, Dict[str, Any]]:
     return mp
 
 
-# =========================================================
 # Core logic: unit conversion + calculations
-# =========================================================
 def normalize_unit(u: str) -> str:
     s = (u or "").strip().lower()
     s = s.replace(".", "")
@@ -450,7 +442,6 @@ def calc_for_batch(batch_fields: Dict[str, Any], labour_items: List[Dict[str, An
 
 # =========================================================
 # UI
-# =========================================================
 st.set_page_config(page_title="Batch Calculator (SharePoint)", layout="wide")
 st.title("Batch Calculator — same logic as your template")
 
@@ -653,8 +644,6 @@ with right:
                 OUT_PROFITTOTAL: calc[OUT_PROFITTOTAL],
             }
 
-            # optional fields: only patch if your list has them (if not, it might error)
-            # 你说你也加了，可直接开着
             patch_fields[OUT_RAWKG] = calc.get(OUT_RAWKG, 0)
             patch_fields[OUT_WASTAGEKG] = calc.get(OUT_WASTAGEKG, 0)
             patch_fields[OUT_CALCAT] = calc.get(OUT_CALCAT, "")
