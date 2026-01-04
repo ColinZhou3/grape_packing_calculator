@@ -494,7 +494,7 @@ def calc_for_batch(batch_fields: Dict[str, Any], labour_items: List[Dict[str, An
 # UI
 # =========================================================
 st.set_page_config(page_title="Batch Calculator (SharePoint)", layout="wide")
-st.title("Batch Calculator — same logic as your template")
+st.title("Batch Calculator")
 
 with st.sidebar:
     st.header("Settings")
